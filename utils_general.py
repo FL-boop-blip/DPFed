@@ -2763,6 +2763,108 @@ def train_model_DPgloss(model, clnt_num, trn_x, trn_y, tst_x, tst_y,
     return model
 
 
+def train_model_DPFedDyn(model, clnt_num, trn_x, trn_y, tst_x, tst_y,
+                         learning_rate, batch_size, epoch, print_per,
+                         weight_decay, dataset_name, sch_step=1, sch_gamma=1,
+                         local_dual_correction_vec=None, lamb=1e-2):
+    """
+    FedDyn-style local training with linear correction term, followed by
+    DPFedAvg-like per-layer DP protection on the communicated update.
+
+    - local_dual_correction_vec: h_i - w_comm (numpy or torch), shape (n_par,)
+    - lamb: FedDyn coefficient for linear term and added to weight decay
+    """
+    n_trn = trn_x.shape[0]
+    trn_gen = data.DataLoader(Dataset(trn_x, trn_y, train=True, dataset_name=dataset_name), batch_size=batch_size,
+                              shuffle=True)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay + lamb)
+
+    # Save initial global parameters to compute DP delta at the end
+    w_global = copy.deepcopy(model)
+
+    model.train(); model = model.to(device)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=sch_step, gamma=sch_gamma)
+
+    # Prepare correction vector
+    corr_vec = None
+    if local_dual_correction_vec is not None:
+        if isinstance(local_dual_correction_vec, np.ndarray):
+            corr_vec = torch.tensor(local_dual_correction_vec, dtype=torch.float32, device=device)
+        elif isinstance(local_dual_correction_vec, torch.Tensor):
+            corr_vec = local_dual_correction_vec.detach().clone().float().to(device)
+
+    print_test = not isinstance(tst_x, bool)
+    loss_trn, acc_trn = get_acc_loss(trn_x, trn_y, model, dataset_name, weight_decay)
+    if print_test:
+        loss_tst, acc_tst = get_acc_loss(tst_x, tst_y, model, dataset_name, 0)
+        print("Epoch %3d, Training Acc: %.4f, Loss: %.4f, Test Acc: %.4f, Loss: %.4f, LR: %.4f"
+              % (0, acc_trn, loss_trn, acc_tst, loss_tst, scheduler.get_lr()[0]))
+    else:
+        print("Epoch %3d, Training Acc: %.4f, Loss: %.4f, LR: %.4f"
+              % (0, acc_trn, loss_trn, scheduler.get_lr()[0]))
+
+    model.train()
+    for e in range(epoch):
+        trn_gen_iter = trn_gen.__iter__()
+        for _ in range(int(np.ceil(n_trn / batch_size))):
+            batch_x, batch_y = trn_gen_iter.__next__()
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+
+            y_pred = model(batch_x)
+            loss_pred = loss_fn(y_pred, batch_y.reshape(-1).long())
+
+            # FedDyn linear correction term: lamb * <params, corr_vec>
+            loss = loss_pred
+            if corr_vec is not None:
+                local_par_list = None
+                for p in model.parameters():
+                    if local_par_list is None:
+                        local_par_list = p.reshape(-1)
+                    else:
+                        local_par_list = torch.cat((local_par_list, p.reshape(-1)), 0)
+                loss = loss + lamb * torch.sum(local_par_list * corr_vec)
+
+            optimizer.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=max_norm)
+            optimizer.step()
+
+        if (e + 1) % print_per == 0:
+            loss_trn, acc_trn = get_acc_loss(trn_x, trn_y, model, dataset_name, weight_decay)
+            if print_test:
+                loss_tst, acc_tst = get_acc_loss(tst_x, tst_y, model, dataset_name, 0)
+                print("Epoch %3d, Training Acc: %.4f, Loss: %.4f, Test Acc: %.4f, Loss: %.4f, LR: %.4f"
+                      % (e + 1, acc_trn, loss_trn, acc_tst, loss_tst, scheduler.get_lr()[0]))
+            else:
+                print("Epoch %3d, Training Acc: %.4f, Loss: %.4f, LR: %.4f" % (e + 1, acc_trn, loss_trn, scheduler.get_lr()[0]))
+            model.train()
+        scheduler.step()
+
+    # DP on delta relative to w_global (per-layer clipping + Gaussian noise)
+    if not isinstance(w_global, dict):
+        w_global = {name: param.clone() for name, param in w_global.named_parameters()}
+
+    dp_sigma = 0.95
+    dp_clip = 0.2
+    clnt = max(1, int(clnt_num))
+    sita = dp_sigma * dp_clip / np.sqrt(clnt)
+
+    for name, param in model.named_parameters():
+        delta_layer = param.data - w_global[name]
+        norm = torch.norm(delta_layer, p=2)
+        scale = min(1.0, (dp_clip / norm).item()) if norm.item() > 0 else 1.0
+        clipped_delta = delta_layer * scale
+        noise = torch.empty_like(delta_layer).normal_(0, sita)
+        protected_update = clipped_delta + noise.to(device)
+        param.data.copy_(w_global[name] + protected_update)
+
+    for p in model.parameters(): p.requires_grad = False
+    model.eval()
+    return model
+
+
 def train_model_DPavg_blur(model,clnt_num,trn_x, trn_y, tst_x, tst_y, learning_rate, batch_size, epoch, print_per, weight_decay,
                     dataset_name, sch_step=1, sch_gamma=1):
     n_trn = trn_x.shape[0]
