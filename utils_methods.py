@@ -4472,6 +4472,184 @@ def train_DPFedAvg(data_obj, act_prob, learning_rate, batch_size, epoch,
                 fed_mdls_sel[i//save_period] = avg_model
   
     return fed_mdls_sel, tst_perf_sel
+
+
+def train_DPFedGloss(data_obj, act_prob, learning_rate, batch_size, epoch,
+                 com_amount, print_per, weight_decay,
+                 model_func, init_model, sch_step, sch_gamma,
+                 save_period, suffix='', trial=True, data_path='', rand_seed=0, lr_decay_per_round=1,
+                 lamb=1e-3, rho_l=0.1, T_s=100, esam_rho=0.5):
+    """
+    DP-FedGloss under DPFed framework.
+    - Local training: ESAM + linear correction (FedGloss)
+    - DP on uploads: DPFedAvg-style per-layer clipping/noise
+    - Server update: w_{t+1} = w_t + avg(delta) + mean(h)
+    - Perturbed broadcast (FedGloss): w_comm = w_t + epsilon (epsilon uses last avg update as pseudo-grad)
+    """
+    suffix = 'DPFedGloss_' + str(epoch) + suffix
+    suffix += '_c%d_S%d_F%f_Lr%f_%d_%f_B%d_E%d_W%f' % (
+        com_amount, save_period, act_prob, learning_rate, sch_step, sch_gamma, batch_size, epoch, weight_decay)
+    suffix += '_lrdecay%f' % lr_decay_per_round
+    suffix += '_seed%d' % rand_seed
+
+    n_clnt = data_obj.n_clnt
+    clnt_x = data_obj.clnt_x
+    clnt_y = data_obj.clnt_y
+    weight_list = np.asarray([len(clnt_y[i]) for i in range(n_clnt)]).reshape((n_clnt, 1))
+
+    if (not trial) and (not os.path.exists('%sModel/%s/%s' % (data_path, data_obj.name, suffix))):
+        os.mkdir('%sModel/%s/%s' % (data_path, data_obj.name, suffix))
+
+    n_save_instances = int(com_amount / save_period)
+    fed_mdls_sel = list(range(n_save_instances))
+    tst_perf_sel = np.zeros((com_amount, 2))
+
+    n_par = len(get_mdl_params([model_func()])[0])
+    init_par_list = get_mdl_params([init_model], n_par)[0]
+    clnt_params_list = np.ones(n_clnt).astype('float32').reshape(-1, 1) * init_par_list.reshape(1, -1)
+
+    # Dual variables per client (FedGloss)
+    h_params_list = np.zeros((n_clnt, n_par), dtype='float32')
+
+    # Server pseudo-grad state for perturbation
+    delta_w_tilde_vec = None  # numpy vector (n_par,)
+
+    saved_itr = -1
+    writer = SummaryWriter('%sRuns_DPFedGloss/%s/%s' % (data_path, data_obj.name, suffix[:26]))
+
+    # Load resume state if any
+    if not trial:
+        for i in range(com_amount):
+            if os.path.exists('%sModel/%s/%s/%dcom_sel.pt' % (data_path, data_obj.name, suffix, i + 1)):
+                saved_itr = i
+                fed_model = model_func()
+                fed_model.load_state_dict(torch.load('%sModel/%s/%s/%dcom_sel.pt'
+                                                     % (data_path, data_obj.name, suffix, i + 1)))
+                fed_model.eval(); fed_model = fed_model.to(device)
+                for p in fed_model.parameters(): p.requires_grad = False
+                fed_mdls_sel[saved_itr // save_period] = fed_model
+                if os.path.exists('%sModel/%s/%s/%dcom_tst_perf_sel.npy' % (data_path, data_obj.name, suffix, (i + 1))):
+                    tst_perf_sel[:i + 1] = np.load('%sModel/%s/%s/%dcom_tst_perf_sel.npy' % (data_path, data_obj.name, suffix, (i + 1)))
+                    clnt_params_list = np.load('%sModel/%s/%s/%d_clnt_params_list.npy' % (data_path, data_obj.name, suffix, i + 1))
+                    # Optional: load h_params_list if saved
+                    h_path = '%sModel/%s/%s/%d_h_params_list.npy' % (data_path, data_obj.name, suffix, i + 1)
+                    if os.path.exists(h_path):
+                        h_params_list = np.load(h_path)
+
+    # Training rounds
+    if (trial) or (not os.path.exists('%sModel/%s/%s/%dcom_sel.pt' % (data_path, data_obj.name, suffix, com_amount))):
+        if saved_itr == -1:
+            avg_model = model_func().to(device)
+            avg_model.load_state_dict(copy.deepcopy(dict(init_model.named_parameters())))
+        else:
+            avg_model = model_func().to(device)
+            avg_model.load_state_dict(torch.load('%sModel/%s/%s/%dcom_sel.pt'
+                                                 % (data_path, data_obj.name, suffix, (saved_itr + 1))))
+
+        for i in range(saved_itr + 1, com_amount):
+            # Select clients
+            inc_seed = 0
+            while True:
+                np.random.seed(i + rand_seed + inc_seed)
+                act_list = np.random.uniform(size=n_clnt)
+                act_clients = act_list <= act_prob
+                selected_clnts = np.sort(np.where(act_clients)[0])
+                inc_seed += 1
+                if len(selected_clnts) != 0:
+                    break
+
+            print('Selected Clients: %s' % (', '.join(['%2d' % item for item in selected_clnts])))
+
+            # Compute broadcast params: w_comm = w_t + epsilon
+            w_t_vec = get_mdl_params([avg_model], n_par)[0]
+            if delta_w_tilde_vec is not None:
+                # rho schedule
+                rho = 0.001 + min(i + 1, T_s) * ((rho_l - 0.001) / max(1, T_s))
+                denom = np.linalg.norm(delta_w_tilde_vec)
+                if denom > 0:
+                    eps_vec = (rho / denom) * delta_w_tilde_vec
+                else:
+                    eps_vec = np.zeros_like(w_t_vec)
+            else:
+                eps_vec = np.zeros_like(w_t_vec)
+
+            w_comm_vec = w_t_vec + eps_vec
+
+            # Train selected clients
+            clnt_models = list(range(n_clnt))
+            # cache local updates for selected clients
+            local_updates = {}
+
+            for clnt in selected_clnts:
+                print('---- Training client %d' % clnt)
+                trn_x = clnt_x[clnt]; trn_y = clnt_y[clnt]
+
+                # Init client model from w_comm
+                clnt_models[clnt] = set_client_from_params(model_func().to(device), w_comm_vec)
+                for p in clnt_models[clnt].parameters(): p.requires_grad = True
+
+                # Local dual correction vector: h_i - w_comm
+                corr_vec = h_params_list[clnt] - w_comm_vec
+
+                # Train with ESAM + correction, then DP protect updates
+                # clnt_num = len(selected_clnts)
+                clnt_num = 50
+                clnt_models[clnt] = train_model_DPgloss(
+                    clnt_models[clnt], clnt_num, trn_x, trn_y, False, False,
+                    learning_rate * (lr_decay_per_round ** i), batch_size, epoch, print_per,
+                    weight_decay, data_obj.dataset, sch_step, sch_gamma,
+                    local_dual_correction_vec=corr_vec, lamb=lamb, esam_rho=esam_rho)
+
+                # Save client params and update
+                clnt_params_list[clnt] = get_mdl_params([clnt_models[clnt]], n_par)[0]
+                local_updates[clnt] = clnt_params_list[clnt] - w_comm_vec
+
+            # Compute averaged model and update server
+            # Weighted average of client models (same as DPFedAvg)
+            avg_local_model_vec = np.sum(clnt_params_list[selected_clnts] * weight_list[selected_clnts] / np.sum(weight_list[selected_clnts]), axis=0)
+            mean_h = np.mean(h_params_list, axis=0)
+
+            # w_{t+1} = avg_local_model - epsilon + mean(h)
+            new_w_vec = avg_local_model_vec - eps_vec + mean_h
+            avg_model = set_client_from_params(model_func(), new_w_vec)
+
+            # Pseudo-grad for next round's epsilon: averaged update
+            if len(local_updates) > 0:
+                # Equal average of local updates
+                upd_mat = np.stack([local_updates[c] for c in local_updates.keys()], axis=0)
+                delta_w_tilde_vec = np.mean(upd_mat, axis=0)
+            else:
+                delta_w_tilde_vec = np.zeros_like(w_t_vec)
+
+            # Update dual variables for selected clients
+            for clnt in selected_clnts:
+                h_params_list[clnt] += local_updates[clnt]
+
+            # Evaluate
+            loss_tst, acc_tst = get_acc_loss(data_obj.tst_x, data_obj.tst_y, avg_model, data_obj.dataset, 0)
+            tst_perf_sel[i] = [loss_tst, acc_tst]
+            print("**** Communication sel %3d, Test Accuracy: %.4f, Loss: %.4f" % (i + 1, acc_tst, loss_tst))
+
+            writer.add_scalars('Loss/test', {'Sel clients': tst_perf_sel[i][0]}, i)
+            writer.add_scalars('Accuracy/test', {'Sel clients': tst_perf_sel[i][1]}, i)
+
+            # Freeze and optionally save
+            for p in avg_model.parameters(): p.requires_grad = False
+            if (not trial) and ((i + 1) % save_period == 0):
+                torch.save(avg_model.state_dict(), '%sModel/%s/%s/%dcom_sel.pt' % (data_path, data_obj.name, suffix, (i + 1)))
+                np.save('%sModel/%s/%s/%dcom_tst_perf_sel.npy' % (data_path, data_obj.name, suffix, (i + 1)), tst_perf_sel[:i + 1])
+                np.save('%sModel/%s/%s/%d_clnt_params_list.npy' % (data_path, data_obj.name, suffix, (i + 1)), clnt_params_list)
+                np.save('%sModel/%s/%s/%d_h_params_list.npy' % (data_path, data_obj.name, suffix, (i + 1)), h_params_list)
+                if (i + 1) > save_period:
+                    for name in ['com_tst_perf_sel', 'clnt_params_list', 'h_params_list']:
+                        old_path = '%sModel/%s/%s/%d%s.npy' % (data_path, data_obj.name, suffix, i + 1 - save_period, '_' + name)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+
+            if ((i + 1) % save_period == 0):
+                fed_mdls_sel[i // save_period] = avg_model
+
+    return fed_mdls_sel, tst_perf_sel
 def train_DPFedSMP_topk(data_obj, act_prob, learning_rate, batch_size, epoch,
                  com_amount, print_per, weight_decay,
                  model_func, init_model, sch_step, sch_gamma,
@@ -8300,7 +8478,6 @@ def train_FedA1(data_obj, act_prob,
                 avg_cld_mdls[i // save_period] = cur_cld_model
 
     return avg_cld_mdls,  tst_cur_cld_perf
-
 
 
 
